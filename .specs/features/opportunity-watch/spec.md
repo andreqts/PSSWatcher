@@ -116,8 +116,10 @@ Every ambiguity is resolved or recorded here - nothing is left silently unclear.
 3. The failure-report email SHALL list, for each recorded failure, its type, the affected query or candidate URL, and the error message.
 4. The system SHALL read the maintainer alert list - one or more newline-separated addresses - from a GitHub Actions secret dedicated to this purpose, distinct from the interested-recipient secret (P1-AC10).
 5. WHEN both a new-opportunity notification and a failure report are due in the same run THEN the system SHALL send them as two separate emails.
+6. WHEN an unhandled exception occurs anywhere in the pipeline after required secrets (OpenRouter, Gmail) have loaded THEN the system SHALL make one best-effort attempt to send the failure-report email, naming the unexpected error, to the maintainer alert list before the process exits with a non-zero status.
+7. IF an unhandled exception occurs before required secrets have loaded THEN the system SHALL make no attempt to send a failure-report email (no credentials exist yet); GitHub Actions' own built-in failure notification to repo admins/watchers is the sole safety net for this case.
 
-**Independent Test**: Register two addresses in the maintainer alert list; force one candidate's Jev call and its free-tier fallback to both fail in a manual run; confirm exactly one failure-report email arrives at each of the two addresses naming that candidate, and confirm a clean run sends none.
+**Independent Test**: Register two addresses in the maintainer alert list; force one candidate's Jev call and its free-tier fallback to both fail in a manual run; confirm exactly one failure-report email arrives at each of the two addresses naming that candidate, and confirm a clean run sends none. Separately, inject an unhandled exception into the state/dedupe step of a manual run (after secrets load) and confirm a failure-report email still arrives naming that error, and that the job still exits non-zero.
 
 ---
 
@@ -143,7 +145,8 @@ Every ambiguity is resolved or recorded here - nothing is left silently unclear.
 - IF `data/seen.json` does not exist yet (first-ever run) THEN the system SHALL treat every validated opportunity as new.
 - IF the DuckDuckGo backend errors or rate-limits for a query THEN the system SHALL log it, skip that query, and continue with the remaining queries rather than failing the whole run.
 - IF the recipient-list secret is empty or unset THEN the system SHALL still update the README report but SHALL skip sending any email (log a warning, not an error).
-- IF the script crashes before completing (an uncaught exception) THEN no self-generated failure-report email can be sent for that run; GitHub Actions' own built-in email notification to repo admins/watchers on a failed workflow run is the safety net for this case (free, already exists, no extra engineering).
+- IF the script crashes before required secrets have loaded THEN no self-generated failure-report email is possible (no credentials exist yet); GitHub Actions' own built-in email notification to repo admins/watchers on a failed workflow run is the sole safety net for this case (free, already exists, no extra engineering).
+- IF the script crashes anywhere after required secrets have loaded (e.g. an unforeseen bug in the dedupe/state logic, or a failure in the search step outside its normal per-query handling) THEN the system SHALL still attempt the maintainer failure-report email (P2-AC6) - this is a design gap identified during review and closed by a single top-level exception guard in the orchestrator, not by defensive handling scattered per module.
 
 ---
 
@@ -167,7 +170,7 @@ Every ambiguity is resolved or recorded here - nothing is left silently unclear.
 
 **Status values:** Pending → In Design → In Tasks → Implementing → Verified
 
-**Coverage:** 11 requirement groups total (covering 28 acceptance criteria across P1-P3), 0 mapped to tasks yet, 11 unmapped ⚠️ (expected pre-Design)
+**Coverage:** 11 requirement groups total (covering 30 acceptance criteria across P1-P3), 0 mapped to tasks yet, 11 unmapped ⚠️ (expected pre-Design)
 
 ---
 
@@ -177,5 +180,6 @@ Every ambiguity is resolved or recorded here - nothing is left silently unclear.
 - [ ] `README.md` always reflects the current set of open opportunities after a successful run.
 - [ ] A recipient receives at most one email per run, containing only opportunities not previously notified.
 - [ ] Monthly OpenRouter spend (Jev classification calls) stays in the "cents, not dollars" range at the described volume.
-- [ ] No recipient email address ever appears in the git history of the public repository.
+- [ ] No recipient or maintainer email address ever appears in the git history or in the repository's (publicly-visible) workflow run logs.
 - [ ] A run with any failure or exclusion produces exactly one failure-report email to every address in the maintainer alert list; a clean run produces zero.
+- [ ] An unhandled exception anywhere in the pipeline (after secrets load) still results in a maintainer failure-report email, not just a silent crash caught only by GitHub's own default notifications.
