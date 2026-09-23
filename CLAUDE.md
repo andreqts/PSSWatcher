@@ -49,6 +49,7 @@ Cross-cutting invariants:
 - **Failure boundary has two zones.** The secret loading in `config.require_env` is deliberately left unwrapped, because without credentials no email can be sent and GitHub's built-in failure email is the only alert. Everything after that runs inside one `try/except` in `run.main()`, which makes a best-effort `send_failure_report` call and then re-raises.
 - **A Jev failure is always a `FailureRecord`**, even when the free fallback recovers the candidate (P1-AC19). A candidate whose fallback also fails is left out of the report and not marked seen. It is never published unvalidated.
 - **Only new ids are classified.** False positives are stored in `seen.json` with `verdict: false_positive` and are never re-classified, reported or emailed.
+- **`notified` is set only after a successful send.** Each run emails every genuine, open, not-yet-notified item, so a failed or skipped send is retried automatically.
 - **All emails use Bcc.** To: is the project's own sending address, so recipients never see each other.
 - **Empty recipient or maintainer lists are valid.** Skip that send and don't record a failure.
 - **The workflow YAML commits `seen.json` and `README.md` back to the repo, not Python.** A `concurrency` group prevents overlapping runs.
