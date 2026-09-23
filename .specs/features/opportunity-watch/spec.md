@@ -42,17 +42,18 @@ Every ambiguity is resolved or recorded here - nothing is left silently unclear.
 | Repo visibility | Public | User's stated intent - the report must be publicly visible (Q9) | y |
 | Validation method | OpenRouter's Jev decision model (`typesafe/jev-latest`), a purpose-built fast/cheap classifier - not a general chat-completion LLM prompt | User explicitly wants Jev, not an LLM; verified live against OpenRouter's own docs on 2026-09-22 (openrouter.ai/typesafe, openrouter.ai/docs/cookbook/evaluate-and-optimize/jev-verified-cascade) | y |
 | Validation fallback | If OpenRouter's Decisions API (the alpha-status endpoint Jev is served through) proves unreliable at implementation time, retry the classification via OpenRouter's `openrouter/free` Free Models Router (auto-selects among free-tier models only) - never `openrouter/auto` and never a paid model. If the free-tier retry also fails, the candidate is excluded and the failure logged (same handling as any other validation failure) | Jev's serving endpoint is explicitly labeled alpha by OpenRouter; user wants zero spend risk from the fallback path - only Jev itself may use paid credits. `openrouter/auto` was considered but OpenRouter's own docs confirm it has no free-only restriction and can route to (and bill) paid models, which would defeat that guarantee | y |
-| Exact model/pricing | Between `typesafe/jev-1.13` and `typesafe/jev-latest`; not picked at Design time - decide in the `validate.py` task, together with re-verifying the live Decisions API endpoint | Not fabricated now; user has pre-loaded paid credits and prioritized reliability over $0 cost (Q10) | n (decide during Tasks) |
+| Exact model/pricing | `typesafe/jev-latest`, read from an optional `JEV_MODEL` environment variable that defaults to it, so switching (e.g. to a pinned `typesafe/jev-1.13`) needs no code change. The model id is re-verified together with the live Decisions API endpoint in the `validate.py` task | User chose `jev-latest` and wants it easy to change later; an env-var default is one line | y |
 | Schedule | Daily cron at `11:00 UTC` (08:00 America/Sao_Paulo, fixed UTC-3, no DST since 2019) | User-specified trigger time (Q1/Q2, corrected from an initial PM/AM typo) | y |
-| Opportunity identity (dedup key) | SHA-256 hash of the normalized result URL | No natural ID exists in scraped results; URL is the only stable identifier across runs | n (agent default, flag if wrong) |
+| Opportunity identity (dedup key) | SHA-256 hash of the normalized result URL | No natural ID exists in scraped results; URL is the only stable identifier across runs | y |
 | Validation-failure handling | If the OpenRouter call errors for a candidate, exclude it from this run's report/notification rather than include it unvalidated | Under-reporting one run is safer than publishing an unverified false positive to a public page | n (agent default, flag if wrong) |
 | Stale-opportunity removal | An opportunity is dropped from the README report after 3 consecutive runs where it no longer appears in search results, but its dedup ID is kept in `seen.json` for 30 days to avoid re-notifying on search flakiness | Not explicitly discussed; a reasonable default balancing "report reflects reality" against "don't spam on a transient search miss" | n (agent default, flag if wrong) |
 | Concurrent runs | Prevented via a GitHub Actions `concurrency` group on the workflow | Manual re-triggers could otherwise race with the scheduled run and corrupt `seen.json`/README | y (technical safeguard, not a product decision) |
 | Email addressing | All recipients of an email go in Bcc; the To: address is the project's own dedicated sending account | Recipients must never see each other's addresses - same privacy reason as keeping them out of git (Q9) | y |
 | False-positive memory | A candidate Jev classifies as a false positive is stored in `seen.json` with a `false_positive` verdict and never re-classified, reported, or notified | No need to spend Jev tokens re-checking the same false positive every day | y |
+| Notification retry | A genuine opportunity is marked `notified` in `seen.json` only after an email containing it was sent successfully; every run's new-opportunity email includes all genuine, open, not-yet-notified opportunities, so a failed or skipped send is retried on the next run | User wants a failed notification re-sent when conditions allow, instead of recipients permanently missing it | y |
 | Maintainer failure alerts | A dedicated GitHub Actions secret (separate from the opportunity-recipient secret) holds a maintainer alert list - one or more newline-separated addresses, same format as the recipient list; one email per run to every address on it, only when that run had a recorded failure/exclusion | User is worried about silently losing an opportunity to an overlooked soft failure, and wants to be able to register more than one maintainer address. GitHub Actions already emails repo admins/watchers for free on a *hard* workflow failure (uncaught crash, non-zero exit) - that's an existing safety net requiring no work here. This feature closes the other gap: a run that succeeds overall but silently excluded a candidate (e.g. Jev + free-fallback both failed for one entry) | y |
 
-**Open questions:** none - all resolved or logged above. Three rows are marked "agent default, flag if wrong" - call these out explicitly if any should be revisited before implementation. The Jev model version is deliberately deferred to the Tasks phase (see "Exact model/pricing").
+**Open questions:** none - all resolved or logged above. Two rows are marked "agent default, flag if wrong" - call these out explicitly if any should be revisited before implementation.
 
 ---
 
@@ -74,7 +75,7 @@ Every ambiguity is resolved or recorded here - nothing is left silently unclear.
 6. IF the Jev/OpenRouter call for a candidate fails (error, timeout, alpha-endpoint outage, or invalid response) THEN the system SHALL retry the classification using an OpenRouter model request restricted to free-tier pricing only - the fallback SHALL never invoke a paid model.
 7. IF the free-tier fallback classification also fails, times out, or returns no usable verdict THEN the system SHALL exclude that candidate from the current run's report and notification, log the failure, and SHALL NOT record its identifier in `data/seen.json`, so it is classified again on the next run.
 8. The system SHALL compute a stable identifier for each candidate as the SHA-256 hash of its normalized URL.
-9. WHEN a candidate classified as genuine has an identifier not present in the previous run's `data/seen.json` THEN the system SHALL classify it as new.
+9. WHEN a genuine, open (non-stale) opportunity is not marked `notified` in `data/seen.json` THEN the system SHALL classify it as new.
 10. WHEN one or more opportunities are classified as new THEN the system SHALL send exactly one email listing only those new opportunities, with every address in the configured recipient list in Bcc and the project's own sending address as the To: address, so no recipient can see another recipient's address.
 11. IF no opportunities are classified as new in a run THEN the system SHALL send no email.
 12. The system SHALL rewrite the marked opportunities section of `README.md` on every run to reflect the current full set of open (non-stale) opportunities, regardless of whether any are new.
@@ -87,7 +88,8 @@ Every ambiguity is resolved or recorded here - nothing is left silently unclear.
 19. WHEN a Jev call fails for a candidate but the subsequent free-tier fallback succeeds THEN the system SHALL still record a failure for that candidate - the candidate itself is not excluded, but the Jev-side failure is not to be silently absorbed; it SHALL still cause the maintainer failure-report email (P2b: Failure-report email alerting) to fire for that run.
 20. The system SHALL ask Jev exactly this question for each candidate, treating an affirmative answer as genuine and a negative one as a false positive: "Esta é uma oportunidade de concurso com vagas para professor efetivo ou temporário (PSS ou Substituto), nas áreas de Computação (Engenharia da Computação ou Ciência da Computação ou afins), Engenharia Elétrica, Engenharia de Energia, para atuação da cidade de Foz do Iguaçu/PR?"
 21. The system SHALL count a run toward the P1-AC13 absence rule only if every configured search query in that run completed without error, so a search-backend outage never removes opportunities from the report.
-22. WHEN an opportunity removed from the report under P1-AC13 reappears in search results while its identifier is still retained under P1-AC14 THEN the system SHALL restore it to the report without re-classifying it and without sending a new-opportunity notification.
+22. WHEN an opportunity removed from the report under P1-AC13 reappears in search results while its identifier is still retained under P1-AC14 THEN the system SHALL restore it to the report without re-classifying it, and SHALL NOT send a new-opportunity notification for it if it is already marked `notified`.
+23. WHEN the new-opportunity email is sent successfully THEN the system SHALL mark every opportunity it listed as `notified` in `data/seen.json`; IF the send fails or is skipped THEN those opportunities SHALL stay un-notified, so the next run includes them again (P1-AC9).
 
 **Independent Test**: Trigger the workflow manually (`workflow_dispatch`) against a small fixed query list; confirm README updates, `seen.json` updates and commits, and an email arrives only when a genuinely new entry is injected into the fixture data. Separately, force only the Jev call (not the free-tier fallback) to fail for one candidate; confirm that candidate still appears in the report (recovered via fallback) AND a failure-report email still arrives noting the Jev-side failure.
 
@@ -151,7 +153,7 @@ Every ambiguity is resolved or recorded here - nothing is left silently unclear.
 - IF the same opportunity URL is returned by more than one site query THEN the system SHALL deduplicate it to a single entry before validation (same hash).
 - IF `data/seen.json` does not exist yet (first-ever run) THEN the system SHALL treat every validated opportunity as new.
 - IF the DuckDuckGo backend errors or rate-limits for a query THEN the system SHALL log it, skip that query, and continue with the remaining queries rather than failing the whole run.
-- IF the recipient-list secret is empty or unset THEN the system SHALL still update the README report but SHALL skip sending any email (log a warning, not an error).
+- IF the recipient-list secret is empty or unset THEN the system SHALL still update the README report but SHALL skip sending any email (log a warning, not an error); the opportunities stay un-notified and are sent once the list is filled (P1-AC23).
 - IF the maintainer-alert secret is empty or unset THEN the system SHALL skip the failure-report email and log a warning (not an error); the run otherwise proceeds normally.
 - IF the git commit/push step fails after the emails were already sent THEN `data/seen.json` is not persisted and the next run SHALL re-send the same new opportunities; this rare duplicate is accepted over risking a missed notification.
 - IF the script crashes before required secrets have loaded THEN no self-generated failure-report email is possible (no credentials exist yet); GitHub Actions' own built-in email notification to repo admins/watchers on a failed workflow run is the sole safety net for this case (free, already exists, no extra engineering).
@@ -166,7 +168,7 @@ Every ambiguity is resolved or recorded here - nothing is left silently unclear.
 | OPW-01 | P1: Search and extraction | P1-AC1, AC2, AC3 | Design | Pending |
 | OPW-02 | P1: Jev validation and fallback | P1-AC4, AC5, AC6, AC7, AC19, AC20 | Design | Pending |
 | OPW-03 | P1: Identity and "new" detection | P1-AC8, AC9 | Design | Pending |
-| OPW-04 | P1: New-opportunity notification | P1-AC10, AC11, AC16 | Design | Pending |
+| OPW-04 | P1: New-opportunity notification | P1-AC10, AC11, AC16, AC23 | Design | Pending |
 | OPW-05 | P1: README report and staleness | P1-AC12, AC13, AC21, AC22 | Design | Pending |
 | OPW-06 | P1: State retention and commit-back | P1-AC14, AC15 | Design | Pending |
 | OPW-07 | P1: Run safety and summary | P1-AC17, AC18 | Design | Pending |
@@ -179,7 +181,7 @@ Every ambiguity is resolved or recorded here - nothing is left silently unclear.
 
 **Status values:** Pending → In Design → In Tasks → Implementing → Verified
 
-**Coverage:** 11 requirement groups total (covering 35 acceptance criteria: P1 22, P2a 3, P2b 8, P3 2), 0 mapped to tasks yet, 11 unmapped ⚠️ (expected until the Tasks phase)
+**Coverage:** 11 requirement groups total (covering 36 acceptance criteria: P1 23, P2a 3, P2b 8, P3 2), 0 mapped to tasks yet, 11 unmapped ⚠️ (expected until the Tasks phase)
 
 ---
 

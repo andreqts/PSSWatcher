@@ -20,7 +20,7 @@ graph TD
         LoadQueries[config: load queries.yaml and address lists] --> RunSearches[search.run_searches]
         RunSearches -->|per-query failure| FailureSearch[FailureRecord: search]
         RunSearches --> DedupeInRun[state: drop results missing title or URL, hash URLs, merge duplicates within this run]
-        DedupeInRun --> DiffNew[state.SeenStore.diff_new: split new vs already-seen ids]
+        DedupeInRun --> DiffNew[state.SeenStore.diff_new: split unseen ids - need classifying - from already-seen ids]
         DiffNew -->|already-seen ids, genuine or false_positive - never re-classified| ApplyRunState
         DiffNew -->|new ids| TryJev[validate.classify: try Jev]
 
@@ -36,13 +36,15 @@ graph TD
         FallbackVerdict -->|false positive| StoreFalsePositive
         StoreFalsePositive --> ApplyRunState
 
-        ApplyRunState --> SaveSeen[state.SeenStore.save: data/seen.json]
-        SaveSeen --> UpdateReadme[report.update_readme: open non-stale genuine set]
-        UpdateReadme --> SendNewOpportunities[notify.send_new_opportunities: new genuine ids only, recipients in Bcc]
-        SendNewOpportunities -->|no new items, or recipient list empty| SkipNewSend[skip send - not a failure]
-        SendNewOpportunities -->|send fails| FailureEmail[FailureRecord: email]
-        SendNewOpportunities -->|sent| AnyFailureThisRun
-        SkipNewSend --> AnyFailureThisRun
+        ApplyRunState --> UpdateReadme[report.update_readme: open non-stale genuine set]
+        UpdateReadme --> SendNewOpportunities[notify.send_new_opportunities: genuine, open, not yet notified - recipients in Bcc]
+        SendNewOpportunities -->|no pending items, or recipient list empty| SkipNewSend[skip send - not a failure, items stay un-notified]
+        SendNewOpportunities -->|send fails| FailureEmail[FailureRecord: email - items stay un-notified, retried next run]
+        SendNewOpportunities -->|sent| MarkNotified[state.SeenStore.mark_notified: listed ids]
+        MarkNotified --> SaveSeen[state.SeenStore.save: data/seen.json]
+        SkipNewSend --> SaveSeen
+        FailureEmail --> SaveSeen
+        SaveSeen --> AnyFailureThisRun
 
         FailureSearch --> AnyFailureThisRun
         FailureSearch -.->|any query failed: count_misses=False| ApplyRunState
@@ -105,7 +107,7 @@ None - this is the first feature in a new repository. Nothing to reuse yet; this
 ### `search`
 
 - **Purpose**: Run every configured query, return raw results, never let one query's failure abort the run.
-- **Location**: `search.py`
+- **Location**: `src/opportunity_watch/search.py`
 - **Interfaces**:
   - `run_searches(queries: list[str]) -> tuple[list[RawResult], list[FailureRecord]]`
 - **Dependencies**: `ddgs`
@@ -114,12 +116,14 @@ None - this is the first feature in a new repository. Nothing to reuse yet; this
 ### `state`
 
 - **Purpose**: Compute the stable dedup id, load/save `seen.json`, record each id's verdict, apply the 3-run stale-removal and 30-day purge rules (spec P1-AC5, 8, 12, 13, 14, 21, 22).
-- **Location**: `state.py`
+- **Location**: `src/opportunity_watch/state.py`
 - **Interfaces**:
   - `opportunity_id(url: str) -> str` - SHA-256 of the normalized URL
   - `load_seen(path: str) -> SeenStore`
-  - `SeenStore.diff_new(candidate_ids: list[str]) -> list[str]` - ids not present in the store
-  - `SeenStore.apply_run(candidates: list[Candidate], today: date, count_misses: bool) -> RunStateResult` - updates verdict/last-seen/miss-count per candidate, returns the current open (non-stale, genuine) set and any newly-purged ids. `count_misses` is False whenever any search query failed this run, so a search outage never increments `miss_count` (P1-AC21). A reappearing id resets `miss_count` to 0 and returns to the open set without a new notification (P1-AC22)
+  - `SeenStore.diff_new(candidate_ids: list[str]) -> list[str]` - ids not present in the store, i.e. the ones that still need classifying (P1-AC4)
+  - `SeenStore.pending_notification() -> list[Candidate]` - genuine, open, not-yet-notified entries (P1-AC9)
+  - `SeenStore.mark_notified(ids: list[str]) -> None` - called only after a successful new-opportunity send (P1-AC23)
+  - `SeenStore.apply_run(candidates: list[Candidate], today: date, count_misses: bool) -> RunStateResult` - updates verdict/last-seen/miss-count per candidate, returns the current open (non-stale, genuine) set and any newly-purged ids. `count_misses` is False whenever any search query failed this run, so a search outage never increments `miss_count` (P1-AC21). A reappearing id resets `miss_count` to 0 and returns to the open set; its `notified` flag is kept, so an already-notified item is not emailed again (P1-AC22)
   - `SeenStore.save(path: str) -> None`
 - **Dependencies**: stdlib (`hashlib`, `json`, `datetime`)
 - **Reuses**: n/a
@@ -127,18 +131,18 @@ None - this is the first feature in a new repository. Nothing to reuse yet; this
 ### `validate`
 
 - **Purpose**: Classify one candidate as genuine / false-positive via Jev, asking exactly the question in spec P1-AC20; on a Jev failure, retry via `openrouter/free`; if that also fails, report the failure so the caller excludes the candidate. **Isolates the one area of real API uncertainty** (see Risks).
-- **Location**: `validate.py`
+- **Location**: `src/opportunity_watch/validate.py`
 - **Interfaces**:
   - `classify(candidate: Candidate) -> ValidationResult`
   - (internal) `_call_jev(candidate) -> JevAnswer` - raises `JevCallError` on any failure
   - (internal) `_call_free_fallback(candidate) -> FallbackAnswer` - raises `ValidationFailed` on any failure
-- **Dependencies**: `requests`, `OPENROUTER_API_KEY`
+- **Dependencies**: `requests`, `OPENROUTER_API_KEY`, optional `JEV_MODEL` (default `typesafe/jev-latest`; set it as a GitHub Actions variable to switch models without a code change)
 - **Reuses**: n/a
 
 ### `report`
 
 - **Purpose**: Rewrite the marked section of `README.md` with the current open (non-stale) set on every run.
-- **Location**: `report.py`
+- **Location**: `src/opportunity_watch/report.py`
 - **Interfaces**:
   - `render_section(open_opportunities: list[Candidate]) -> str`
   - `update_readme(path: str, rendered: str) -> bool` - returns whether the file content actually changed (drives the "commit only if changed" workflow step)
@@ -149,7 +153,7 @@ None - this is the first feature in a new repository. Nothing to reuse yet; this
 ### `notify`
 
 - **Purpose**: Send the new-opportunity email and the failure-report email over Gmail SMTP. **Never logs a raw address** (AD-001).
-- **Location**: `notify.py`
+- **Location**: `src/opportunity_watch/notify.py`
 - **Interfaces**:
   - `send_new_opportunities(new_items: list[Candidate], recipients: list[str]) -> NotifyResult`
   - `send_failure_report(failures: list[FailureRecord], maintainer_list: list[str]) -> NotifyResult`
@@ -159,7 +163,7 @@ None - this is the first feature in a new repository. Nothing to reuse yet; this
 ### `run` (orchestrator)
 
 - **Purpose**: Sequence every step, accumulate `FailureRecord`s from each stage, decide which emails to send, print the run summary (spec P1-AC18 / P3) to stdout - captured natively by the Actions job log, no logging library needed.
-- **Location**: `run.py`
+- **Location**: `src/opportunity_watch/run.py`
 - **Interfaces**:
   - `main() -> int` (exit code; the workflow step, not this function, decides whether a non-zero code should fail the job)
 - **Failure boundary (two zones, not one)**:
@@ -189,6 +193,7 @@ class Candidate:
     last_seen: str      # ISO date
     miss_count: int      # consecutive counted runs absent from search results (P1-AC21)
     verdict: Literal["genuine", "false_positive"]
+    notified: bool       # True only after a successful new-opportunity email listed it (P1-AC23)
 
 @dataclass
 class ValidationResult:
@@ -216,7 +221,7 @@ class RunSummary:
     failures: list[FailureRecord]
 ```
 
-**Relationships**: `RawResult` → deduped/hashed into `Candidate` → each *new* `Candidate` (per `state.SeenStore.diff_new`) gets exactly one `ValidationResult`; already-seen ids were validated on the run that first saw them and are not re-validated → genuine + non-stale candidates are what `report.py` renders and what `notify.send_new_opportunities` filters to "new since last run" via `state.SeenStore.diff_new`. Any `FailureRecord` collected anywhere in the pipeline feeds `notify.send_failure_report` and the `RunSummary` log line.
+**Relationships**: `RawResult` → deduped/hashed into `Candidate` → each *new* `Candidate` (per `state.SeenStore.diff_new`) gets exactly one `ValidationResult`; already-seen ids were validated on the run that first saw them and are not re-validated → genuine + non-stale candidates are what `report.py` renders and what `report.py` renders; `notify.send_new_opportunities` gets the genuine, open, not-yet-notified subset via `state.SeenStore.pending_notification`, and only a successful send marks them `notified`. Any `FailureRecord` collected anywhere in the pipeline feeds `notify.send_failure_report` and the `RunSummary` log line.
 
 **`data/seen.json` shape** (persisted `SeenStore`):
 
@@ -230,7 +235,8 @@ class RunSummary:
       "first_seen": "2026-09-22",
       "last_seen": "2026-09-22",
       "miss_count": 0,
-      "verdict": "genuine"
+      "verdict": "genuine",
+      "notified": true
     }
   }
 }
@@ -243,12 +249,6 @@ queries:
   # UNILA - federal, single campus (Foz do Iguaçu)
   - 'site:unila.edu.br "professor substituto"'
   - 'site:unila.edu.br "concurso público" "magistério superior"'
-  # UTFPR - federal
-  - 'site:utfpr.edu.br "professor substituto"'
-  - 'site:utfpr.edu.br "concurso público" "magistério superior"'
-  # UFPR - federal
-  - 'site:ufpr.br "professor substituto"'
-  - 'site:ufpr.br "concurso público" "magistério superior"'
   # IFPR - federal, multi-campus: temporary (PSS/substituto) and permanent (EBTT career)
   - 'site:ifpr.edu.br "processo seletivo simplificado"'
   - 'site:ifpr.edu.br "professor substituto" "Foz do Iguaçu"'
@@ -259,7 +259,7 @@ queries:
   - 'site:unioeste.br "concurso público" docentes "Foz do Iguaçu"'
 ```
 
-The first query of each federal institution is the user's original example; the rest are additions. `"Foz do Iguaçu"` is added only to the new queries for multi-campus institutions, to cut results from other campuses before they cost a Jev call; Jev (spec P1-AC20) remains the actual location filter.
+The first query of UNILA and IFPR is the user's original example; the rest are additions. UTFPR and UFPR were removed on 2026-09-22 because neither appears to have a Foz do Iguaçu campus - re-add them in this file if that changes. `"Foz do Iguaçu"` is added only to the new queries for multi-campus institutions, to cut results from other campuses before they cost a Jev call; Jev (spec P1-AC20) remains the actual location filter.
 
 ---
 
@@ -272,7 +272,7 @@ The first query of each federal institution is the user's original example; the 
 | Free-tier fallback also fails | Candidate excluded from this run's report/notification, `FailureRecord(type="validation", excluded=True)` logged | That candidate is silently missing from README *this run* - surfaces to the maintainer via the failure-report email, and will be retried next run since it's not marked "seen" |
 | Missing required secret (`OPENROUTER_API_KEY`, Gmail creds) | `config.require_env` raises immediately, job fails loudly | GitHub Actions' own built-in failure email (free, no work needed) reaches repo admins |
 | Empty/unset recipient or maintainer list | Treated as valid - `notify` skips that send, no `FailureRecord` (matches spec edge case, not an error) | No email sent for that list this run |
-| Email send fails (either list) | Caught in `notify`, logged as `FailureRecord(type="email")`, run still completes and commits | Report still publishes. A failed new-opportunities email reaches the maintainer via the failure report, which is sent last. A failed failure-report email has no further escalation - see Risks |
+| Email send fails (either list) | Caught in `notify`, logged as `FailureRecord(type="email")`, run still completes and commits | Report still publishes. A failed new-opportunities email reaches the maintainer via the failure report, which is sent last, and its items stay un-notified, so the next run's email retries them (P1-AC23). A failed failure-report email has no further escalation - see Risks |
 | `git commit`/`push` fails (workflow step) | Handled entirely at the YAML level, not Python | Job fails → GitHub Actions' own built-in email is the safety net (spec Edge Cases). Because the emails already went out but `seen.json` was not persisted, the next run re-sends the same new items - accepted as a rare duplicate over a missed notification |
 | Any unexpected/uncaught exception after secrets load (e.g. a bug in `state`'s dedupe/diff, or `search.run_searches` failing outside its per-query handling) | `run.main()`'s single top-level `try/except` catches it, best-effort sends the failure-report email describing the error, then re-raises | Report may be stale for this run, but **both** the maintainer-alert list and GitHub Actions' own admin/watcher email are notified - not just the latter |
 | Uncaught exception *before* secrets load (`config.require_env` itself failing) | Deliberately unguarded - no Gmail credentials exist yet to send anything | Only GitHub Actions' own built-in failure email fires (unchanged from before) |
