@@ -123,7 +123,7 @@ None - this is the first feature in a new repository. Nothing to reuse yet; this
   - `SeenStore.diff_new(candidate_ids: list[str]) -> list[str]` - ids not present in the store, i.e. the ones that still need classifying (P1-AC4)
   - `SeenStore.pending_notification() -> list[Candidate]` - genuine, open, not-yet-notified entries (P1-AC9)
   - `SeenStore.mark_notified(ids: list[str]) -> None` - called only after a successful new-opportunity send (P1-AC23)
-  - `SeenStore.apply_run(candidates: list[Candidate], today: date, count_misses: bool) -> RunStateResult` - updates verdict/last-seen/miss-count per candidate, returns the current open (non-stale, genuine) set and any newly-purged ids. `count_misses` is False whenever any search query failed this run, so a search outage never increments `miss_count` (P1-AC21). A reappearing id resets `miss_count` to 0 and returns to the open set; its `notified` flag is kept, so an already-notified item is not emailed again (P1-AC22)
+  - `SeenStore.apply_run(found_ids: set[str], new_candidates: list[Candidate], today: date, count_misses: bool) -> RunStateResult` - `found_ids` is every id in this run's deduped search results (new or already seen); `new_candidates` are only the freshly classified entries to insert. Already-seen ids get `last_seen`/`miss_count` updated from the store and their stored `verdict` and `notified` are never overwritten. Returns returns the current open (non-stale, genuine) set and any newly-purged ids. `count_misses` is False whenever any search query failed this run, so a search outage never increments `miss_count` (P1-AC21). A reappearing id resets `miss_count` to 0 and returns to the open set; its `notified` flag is kept, so an already-notified item is not emailed again (P1-AC22)
   - `SeenStore.save(path: str) -> None`
 - **Dependencies**: stdlib (`hashlib`, `json`, `datetime`)
 - **Reuses**: n/a
@@ -133,7 +133,7 @@ None - this is the first feature in a new repository. Nothing to reuse yet; this
 - **Purpose**: Classify one candidate as genuine / false-positive via Jev, asking exactly the question in spec P1-AC20; on a Jev failure, retry via `openrouter/free`; if that also fails, report the failure so the caller excludes the candidate. **Isolates the one area of real API uncertainty** (see Risks).
 - **Location**: `src/opportunity_watch/validate.py`
 - **Interfaces**:
-  - `classify(candidate: Candidate) -> ValidationResult`
+  - `classify(candidate: Candidate) -> tuple[ValidationResult, list[FailureRecord]]` - same shape as `search.run_searches`; the list holds the degraded (`excluded=False`) or excluded (`excluded=True`) validation failure, empty when Jev succeeded
   - (internal) `_call_jev(candidate) -> JevAnswer` - raises `JevCallError` on any failure
   - (internal) `_call_free_fallback(candidate) -> FallbackAnswer` - raises `ValidationFailed` on any failure
 - **Dependencies**: `requests`, `OPENROUTER_API_KEY`, optional `JEV_MODEL` (default `typesafe/jev-latest`; set it as a GitHub Actions variable to switch models without a code change)
@@ -158,6 +158,7 @@ None - this is the first feature in a new repository. Nothing to reuse yet; this
   - `send_new_opportunities(new_items: list[Candidate], recipients: list[str]) -> NotifyResult`
   - `send_failure_report(failures: list[FailureRecord], maintainer_list: list[str]) -> NotifyResult`
 - **Dependencies**: `smtplib`, `email.mime.text` (stdlib)
+- **Returns**: a `NotifyResult` (see Data Models); a send error is caught and returned as `NotifyResult.failure` (`type="email"`), never raised, so `run.main` can add it to the failure report (P2b-AC1)
 - **Reuses**: shared internal `_send(subject, body, bcc_list)` helper - To: is always `GMAIL_ADDRESS`, every recipient goes in Bcc (spec P1-AC10, P2b-AC8)
 
 ### `run` (orchestrator)
@@ -219,6 +220,12 @@ class RunSummary:
     new_count: int
     excluded_count: int
     failures: list[FailureRecord]
+
+@dataclass
+class NotifyResult:
+    sent_to: int                   # number of Bcc recipients - a count, never addresses (AD-001)
+    skipped: bool                  # True when nothing to send or the list is empty (not a failure)
+    failure: FailureRecord | None  # set when the send failed; run.main appends it to the run's failures
 ```
 
 **Relationships**: `RawResult` → deduped/hashed into `Candidate` → each *new* `Candidate` (per `state.SeenStore.diff_new`) gets exactly one `ValidationResult`; already-seen ids were validated on the run that first saw them and are not re-validated → genuine + non-stale candidates are what `report.py` renders and what `report.py` renders; `notify.send_new_opportunities` gets the genuine, open, not-yet-notified subset via `state.SeenStore.pending_notification`, and only a successful send marks them `notified`. Any `FailureRecord` collected anywhere in the pipeline feeds `notify.send_failure_report` and the `RunSummary` log line.
@@ -258,10 +265,6 @@ queries:
   - 'site:unioeste.br "professor colaborador" "Foz do Iguaçu"'
   - 'site:unioeste.br "concurso público" docentes "Foz do Iguaçu"'
 ```
-
-The first query of UNILA and IFPR is the user's original example; the rest are additions. UTFPR and UFPR were removed on 2026-09-22 because neither appears to have a Foz do Iguaçu campus - re-add them in this file if that changes. `"Foz do Iguaçu"` is added only to the new queries for multi-campus institutions, to cut results from other campuses before they cost a Jev call; Jev (spec P1-AC20) remains the actual location filter.
-
----
 
 ## Error Handling Strategy
 
