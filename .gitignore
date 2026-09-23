@@ -1,0 +1,4 @@
+# agent tooling - machine-local state
+.tlc/
+.agents/.skill-lock.json.backup
+.claude/settings.local.json
